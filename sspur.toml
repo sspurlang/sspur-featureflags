@@ -1,0 +1,5 @@
+[package]
+name = "featureflags"
+version = "0.1.0"
+description = "Feature flags: targeting rules, segments, prerequisites, stable percentage rollouts, OpenFeature-style details, JSON definitions and a SQLite store with audit"
+license = "MIT"

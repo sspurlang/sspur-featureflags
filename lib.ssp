@@ -1,0 +1,1141 @@
+// featureflags: feature flags with targeting, segments, prerequisites and stable percentage
+// rollouts. Evaluation is pure and follows the OpenFeature evaluation model (values, variants,
+// reasons and error codes); definitions are a JSON format that is validated with precise errors,
+// and can be loaded from a file or kept in SQLite with versioned updates and an audit history.
+
+// ---------- values and contexts ----------
+
+// The value of one variant.
+pub type FlagValue = BoolV{v: Bool} | StrV{v: Str} | IntV{v: Int} | NumV{v: F64} derive Eq, Show
+
+// The name of a value's type: `boolean`, `string`, `integer` or `number`.
+pub fn type_name(v: FlagValue) -> Str
+  ex type_name(BoolV{v: true}) == "boolean"
+= match v
+  | BoolV => "boolean"
+  | StrV => "string"
+  | IntV => "integer"
+  | NumV => "number"
+
+// Who a flag is evaluated for: the targeting key (a user, account or device id; used for
+// explicit targets and as the default bucketing key) and string attributes. A rule's attribute
+// `key` means the targeting key unless the attributes define `key` themselves.
+pub type Context = {key: Str, attrs: Map[Str, Str]} derive Eq, Show
+
+// A context for `key` with no attributes.
+pub fn context(key: Str) -> Context
+= Context{key, attrs: empty_map()}
+
+// The context with attribute `name` set to `value`.
+pub fn with_attr(c: Context, name: Str, value: Str) -> Context
+= c with attrs := c.attrs.put(name, value)
+
+// The value of attribute `name` in `c`, or none. `key` falls back to the targeting key, and an
+// empty targeting key counts as missing.
+pub fn attr(c: Context, name: Str) -> Opt[Str]
+  ex attr(context("u1"), "key") == some("u1")
+  ex attr(context(""), "key") == none
+= match c.attrs.get(name)
+  | some(v) => some(v)
+  | none => if name == "key" and c.key != "" then some(c.key) else none
+
+// ---------- definitions ----------
+
+// A comparison in a rule. Every operator except `NotExists` is false when the attribute is
+// missing. `Equals` and `NotEquals` take one value, `In` and `NotIn` one or more, the string
+// operators (`Contains`, `NotContains`, `StartsWith`, `EndsWith`) and `Matches` (a regular
+// expression; the stdlib engine runs in linear time, so a pattern can't hang the server) are true
+// when any value fits, `Lt` `Le` `Gt` `Ge` compare numbers (false if either side isn't one),
+// `Before` and `After` compare ISO 8601 times, and `Exists` and `NotExists` take no values.
+// Comparisons are exact and case-sensitive.
+pub type Op = Equals | NotEquals | In | NotIn | Contains | NotContains | StartsWith | EndsWith | Lt | Le | Gt | Ge | Matches | Before | After | Exists | NotExists derive Eq, Show
+
+// A targeting condition: an attribute comparison, membership of a segment, or a combination.
+// `AllClauses([])` is true and `AnyClause([])` is false.
+pub type Clause = AttrClause{attr: Str, op: Op, values: List[Str]} | SegmentClause{segment: Str} | AllClauses{cs: List[Clause]} | AnyClause{cs: List[Clause]} | NotClause{c: Clause} | AlwaysClause derive Eq, Show
+
+// What a rule (or the fallthrough) serves: one variant, or a weighted split of variants by a
+// stable hash of the bucketing attribute (`bucket_by`, `key` for the targeting key). Weights are
+// relative non-negative integers (percentages, or parts of 100000 for finer steps).
+pub type Serve = Fixed{variant: Str} | Weighted{weights: List[(Str, Int)], bucket_by: Str} derive Eq, Show
+
+// A targeting rule: when `when` holds, serve `serve`. `id` names it in evaluation details.
+pub type Rule = {id: Str, when: Clause, serve: Serve} derive Eq, Show
+
+// Contexts whose targeting key is in `keys` get `variant`, before any rule: allow and deny lists.
+pub type Target = {variant: Str, keys: List[Str]} derive Eq, Show
+
+// The flag `flag` must evaluate to one of `variants` for this flag to be on.
+pub type Prereq = {flag: Str, variants: List[Str]} derive Eq, Show
+
+// A flag. When `enabled` is false it serves `off_variant`. Otherwise its prerequisites must hold
+// (else `off_variant`), then explicit targets, then the first matching rule, then `fallthrough`
+// decide. `salt` changes every bucket of the flag at once (leave it `""` to bucket by the key
+// alone); `version` counts changes.
+pub type Flag = {key: Str, enabled: Bool, variants: List[(Str, FlagValue)], off_variant: Str, fallthrough: Serve, targets: List[Target], rules: List[Rule], prerequisites: List[Prereq], salt: Str, version: Int} derive Eq, Show
+
+// A reusable set of contexts: `excluded` keys never belong, `included` keys always do, and
+// otherwise a context belongs when any of `rules` holds. Segment rules may not refer to segments.
+pub type Segment = {key: Str, included: List[Str], excluded: List[Str], rules: List[Clause]} derive Eq, Show
+
+// A set of flags and segments, with the version of the store they came from (0 for a file).
+// Share it between request handlers as any immutable value.
+pub type Snapshot = {flags: Map[Str, Flag], segments: Map[Str, Segment], version: Int} derive Eq, Show
+
+// A boolean flag: `on` (true) and `off` (false), off when disabled, on for everyone when enabled
+// unless rules say otherwise.
+pub fn bool_flag(key: Str, enabled: Bool) -> Flag
+  post r.variants.len == 2
+= Flag{key, enabled, variants: [("on", BoolV{v: true}), ("off", BoolV{v: false})], off_variant: "off", fallthrough: Fixed{variant: "on"}, targets: [], rules: [], prerequisites: [], salt: "", version: 0}
+
+// A flag with string variants, serving `default_variant` to everyone when enabled and
+// `off_variant` when disabled.
+pub fn string_flag(key: Str, enabled: Bool, variants: List[(Str, Str)], default_variant: Str, off_variant: Str) -> Flag
+  post r.variants.len == variants.len
+= Flag{key, enabled, variants: variants.map(p => (p.0, StrV{v: p.1})), off_variant, fallthrough: Fixed{variant: default_variant}, targets: [], rules: [], prerequisites: [], salt: "", version: 0}
+
+// The flag with `rule` added after its other rules.
+pub fn add_rule(f: Flag, rule: Rule) -> Flag
+= f with rules := f.rules.push(rule)
+
+// The flag with an explicit target: `keys` get `variant`.
+pub fn add_target(f: Flag, variant: Str, keys: List[Str]) -> Flag
+= f with targets := f.targets.push(Target{variant, keys})
+
+// The flag with a prerequisite.
+pub fn add_prereq(f: Flag, flag: Str, variants: List[Str]) -> Flag
+= f with prerequisites := f.prerequisites.push(Prereq{flag, variants})
+
+// The flag serving `s` when no target or rule decides.
+pub fn with_fallthrough(f: Flag, s: Serve) -> Flag
+= f with fallthrough := s
+
+// A percentage rollout: `pct` percent (0 to 100, in steps of 0.001) of contexts, by targeting key,
+// get `on`, the rest `off`. Raising the percentage later keeps everyone who already had `on`.
+pub fn rollout(on: Str, off: Str, pct: F64 where _ >= 0.0 and _ <= 100.0) -> Serve
+  ex rollout("on", "off", 25.0) == Weighted{weights: [("on", 25000), ("off", 75000)], bucket_by: "key"}
+= do
+  w = (pct * 1000.0).round
+  Weighted{weights: [(on, w), (off, 100000 - w)], bucket_by: "key"}
+
+// A rule matching one attribute.
+pub fn rule(id: Str, attr: Str, op: Op, values: List[Str], serve: Serve) -> Rule
+= Rule{id, when: AttrClause{attr, op, values}, serve}
+
+// A snapshot of these flags and segments (later ones replace earlier ones with the same key).
+pub fn snapshot(flags: List[Flag], segments: List[Segment]) -> Snapshot
+= Snapshot{flags: flags.fold(empty_map(), (m, f) => m.put(f.key, f)), segments: segments.fold(empty_map(), (m, s) => m.put(s.key, s)), version: 0}
+
+// ---------- bucketing ----------
+
+// The bucket of `bucket_key` for a flag, from 0 to 99999: the first four bytes of
+// SHA-256(`flag_key` "." `salt` "." `bucket_key`), as an unsigned big-endian integer, scaled to
+// 100000. The same inputs always give the same bucket, in every process and tier, and buckets are
+// uniform to within 0.003%.
+pub fn bucket(flag_key: Str, salt: Str, bucket_key: Str) -> Int
+  post r >= 0 and r < 100000
+= do
+  b = crypto.sha256(flag_key + "." + salt + "." + bucket_key).to_list
+  n = b[0] * 16777216 + b[1] * 65536 + b[2] * 256 + b[3]
+  n * 100000 / 4294967296
+
+// The variant a split gives to bucket `b` (0 to 99999): weights are laid out in order over the
+// buckets, in proportion. None when every weight is 0.
+pub fn split_variant(weights: List[(Str, Int)], b: Int where _ >= 0 and _ < 100000) -> Opt[Str]
+  ex split_variant([("a", 1), ("b", 3)], 24999) == some("a")
+  ex split_variant([("a", 1), ("b", 3)], 25000) == some("b")
+= do
+  total = weights.map(w => max(0, w.1)).sum
+  if total <= 0 then none
+  else do
+    pos = b * total / 100000
+    var acc = 0
+    var found = none
+    for w in weights
+      if found.is_none and max(0, w.1) > 0 and pos < acc + max(0, w.1) then found := some(w.0)
+      acc := acc + max(0, w.1)
+    found
+
+// ---------- evaluation ----------
+
+// Why a flag has the value it has, as in OpenFeature: `Static` (the flag has no targets or rules),
+// `Default` (nothing matched; the fallthrough variant), `TargetingMatch` (a target or rule
+// matched), `Split` (a weighted split chose), `Disabled` (the flag is off), `PrerequisiteFailed`
+// (a prerequisite did not hold; the off variant), or `ErrorReason` (see the error code; the
+// caller's default is used).
+pub type Reason = Static | Default | TargetingMatch | Split | Disabled | PrerequisiteFailed | ErrorReason derive Eq, Show
+
+// The OpenFeature spelling of a reason: `STATIC`, `DEFAULT`, `TARGETING_MATCH`, `SPLIT`,
+// `DISABLED`, `PREREQUISITE_FAILED` or `ERROR`.
+pub fn reason_name(r: Reason) -> Str
+  ex reason_name(TargetingMatch) == "TARGETING_MATCH"
+= match r
+  | Static => "STATIC"
+  | Default => "DEFAULT"
+  | TargetingMatch => "TARGETING_MATCH"
+  | Split => "SPLIT"
+  | Disabled => "DISABLED"
+  | PrerequisiteFailed => "PREREQUISITE_FAILED"
+  | ErrorReason => "ERROR"
+
+// What went wrong, as in OpenFeature: no such flag, a typed accessor for another type, a split
+// without its bucketing attribute, or a definition that refers to something missing or forms a
+// prerequisite cycle (`General`, with a message). `ParseError` and `InvalidContext` complete the
+// OpenFeature set for code that wraps this package (definitions that failed to load, a context
+// it rejects); evaluation itself never produces them.
+pub type ErrorCode = FlagNotFound | TypeMismatch | ParseError | TargetingKeyMissing | InvalidContext | General derive Eq, Show
+
+// The OpenFeature spelling of an error code: `FLAG_NOT_FOUND`, `TYPE_MISMATCH`, `PARSE_ERROR`,
+// `TARGETING_KEY_MISSING`, `INVALID_CONTEXT` or `GENERAL`.
+pub fn error_name(e: ErrorCode) -> Str
+  ex error_name(FlagNotFound) == "FLAG_NOT_FOUND"
+= match e
+  | FlagNotFound => "FLAG_NOT_FOUND"
+  | TypeMismatch => "TYPE_MISMATCH"
+  | ParseError => "PARSE_ERROR"
+  | TargetingKeyMissing => "TARGETING_KEY_MISSING"
+  | InvalidContext => "INVALID_CONTEXT"
+  | General => "GENERAL"
+
+// The result of evaluating a flag: the value and variant (none on an error), why, the error code
+// and a message on an error, the id of the rule that matched (`target:VARIANT` for an explicit
+// target), and the flag's version.
+pub type Details = {key: Str, value: Opt[FlagValue], variant: Opt[Str], reason: Reason, error: Opt[ErrorCode], message: Str, rule: Opt[Str], flag_version: Int} derive Eq, Show
+
+fn failed(key: Str, code: ErrorCode, message: Str, version: Int) -> Details
+= Details{key, value: none, variant: none, reason: ErrorReason, error: some(code), message, rule: none, flag_version: version}
+
+fn served(f: Flag, variant: Str, reason: Reason, rule: Opt[Str]) -> Details
+= match f.variants.find(v => v.0 == variant)
+  | some(v) => Details{key: f.key, value: some(v.1), variant: some(variant), reason, error: none, message: "", rule, flag_version: f.version}
+  | none => failed(f.key, General, "the flag has no variant '{variant}'", f.version)
+
+fn num(s: Str) -> Opt[F64]
+= s.trim.to_f64
+
+fn compare_num(a: Str, b: Str, ok: Int -> Bool) -> Bool
+= match (num(a), num(b))
+  | (some(x), some(y)) => ok(if x < y then -1 else if x > y then 1 else 0)
+  | _ => false
+
+fn compare_time(a: Str, b: Str, ok: Int -> Bool) -> Bool
+= match (parse_time(a.trim), parse_time(b.trim))
+  | (some(x), some(y)) => ok(if x < y then -1 else if x > y then 1 else 0)
+  | _ => false
+
+fn regex_any(pats: List[Str], v: Str) -> Bool
+= pats.any(p => regex(p).map(r => r.is_match(v)).or(false))
+
+// Whether attribute value `v` satisfies `op` against `values`.
+fn op_holds(op: Op, v: Str, values: List[Str]) -> Bool
+= do
+  first = values.first.or("")
+  match op
+  | Equals => values.len == 1 and v == first
+  | NotEquals => values.len == 1 and v != first
+  | In => values.contains(v)
+  | NotIn => not values.contains(v)
+  | Contains => values.any(x => v.contains(x))
+  | NotContains => not values.any(x => v.contains(x))
+  | StartsWith => values.any(x => v.starts_with(x))
+  | EndsWith => values.any(x => v.ends_with(x))
+  | Lt => compare_num(v, first, c => c < 0)
+  | Le => compare_num(v, first, c => c <= 0)
+  | Gt => compare_num(v, first, c => c > 0)
+  | Ge => compare_num(v, first, c => c >= 0)
+  | Matches => regex_any(values, v)
+  | Before => compare_time(v, first, c => c < 0)
+  | After => compare_time(v, first, c => c > 0)
+  | Exists => true
+  | NotExists => false
+
+// Whether `c` holds for `ctx`, with the snapshot's segments. A clause naming a missing segment is
+// false (validation reports it).
+pub fn clause_holds(s: Snapshot, c: Clause, ctx: Context) -> Bool
+  ex clause_holds(snapshot([], []), AttrClause{attr: "plan", op: In, values: ["pro", "team"]}, with_attr(context("u"), "plan", "pro"))
+= holds(s, c, ctx, true)
+
+fn holds(s: Snapshot, c: Clause, ctx: Context, segments: Bool) -> Bool
+= match c
+  | AttrClause{attr: name, op, values} => attr_holds(attr(ctx, name), op, values)
+  | SegmentClause{segment} => segments and segment_holds(s, s.segments.get(segment), ctx)
+  | AllClauses{cs} => cs.all(x => holds(s, x, ctx, segments))
+  | AnyClause{cs} => cs.any(x => holds(s, x, ctx, segments))
+  | NotClause{c} => not holds(s, c, ctx, segments)
+  | AlwaysClause => true
+
+fn attr_holds(v: Opt[Str], op: Op, values: List[Str]) -> Bool
+= match v
+  | some(x) => op_holds(op, x, values)
+  | none => op == NotExists
+
+fn segment_holds(s: Snapshot, seg: Opt[Segment], ctx: Context) -> Bool
+= match seg
+  | some(g) => in_segment(s, g, ctx)
+  | none => false
+
+// Whether `ctx` belongs to segment `seg`: not excluded, and included or matched by a rule. A
+// segment rule that names a segment is false (validation reports it).
+pub fn in_segment(s: Snapshot, seg: Segment, ctx: Context) -> Bool
+= if ctx.key != "" and seg.excluded.contains(ctx.key) then false else if ctx.key != "" and seg.included.contains(ctx.key) then true else seg.rules.any(r => holds(s, r, ctx, false))
+
+fn serve(f: Flag, sv: Serve, ctx: Context, matched: Reason, rule: Opt[Str]) -> Details
+= match sv
+  | Fixed{variant} => served(f, variant, matched, rule)
+  | Weighted{weights, bucket_by} => serve_split(f, weights, bucket_by, attr(ctx, bucket_by), rule)
+
+fn serve_split(f: Flag, weights: List[(Str, Int)], bucket_by: Str, k: Opt[Str], rule: Opt[Str]) -> Details
+= match k.map(x => split_variant(weights, bucket(f.key, f.salt, x)))
+  | none => failed(f.key, TargetingKeyMissing, "the split needs the attribute '{bucket_by}'", f.version)
+  | some(none) => failed(f.key, General, "the split has no positive weight", f.version)
+  | some(some(v)) => served(f, v, Split, rule)
+
+fn eval_in(s: Snapshot, key: Str, ctx: Context, seen: List[Str]) -> Details
+= match s.flags.get(key)
+  | none => failed(key, FlagNotFound, "no flag '{key}'", 0)
+  | some(f) => if seen.contains(key) then failed(key, General, "prerequisites form a cycle: {(seen + [key]).join(" -> ")}", f.version) else eval_flag(s, f, ctx, seen.push(key))
+
+fn prereq_holds(s: Snapshot, p: Prereq, ctx: Context, seen: List[Str]) -> Opt[Details]
+= do
+  d = eval_in(s, p.flag, ctx, seen)
+  if d.error.is_some then some(d) else if d.variant.map(v => p.variants.contains(v)) == some(true) then none else some(d)
+
+fn eval_flag(s: Snapshot, f: Flag, ctx: Context, seen: List[Str]) -> Details
+= do
+  if not f.enabled then return served(f, f.off_variant, Disabled, none)
+  for p in f.prerequisites
+    match prereq_holds(s, p, ctx, seen)
+    | some(d) => return if d.error == some(General) and d.message.starts_with("prerequisites form a cycle") then failed(f.key, General, d.message, f.version) else served(f, f.off_variant, PrerequisiteFailed, some("prerequisite:" + p.flag))
+    | none => ()
+  match f.targets.find(t => ctx.key != "" and t.keys.contains(ctx.key))
+  | some(t) => served(f, t.variant, TargetingMatch, some("target:" + t.variant))
+  | none => match f.rules.find(r => clause_holds(s, r.when, ctx))
+    | some(r) => serve(f, r.serve, ctx, TargetingMatch, some(r.id))
+    | none => serve(f, f.fallthrough, ctx, if f.targets.is_empty and f.rules.is_empty then Static else Default, none)
+
+// Evaluates flag `key` for `ctx`. Pure: the same snapshot and context always give the same
+// details.
+pub fn evaluate(s: Snapshot, key: Str, ctx: Context) -> Details
+= eval_in(s, key, ctx, [])
+
+// A typed result: the value (the caller's default on any error) and the details.
+pub type Resolved[T] = {value: T, details: Details} derive Eq, Show
+
+fn mismatch(d: Details, want: Str) -> Details
+= failed(d.key, TypeMismatch, "the flag is {d.value.map(type_name).or("?")}, not {want}", d.flag_version)
+
+// A boolean flag's value and details; `default` on any error, including `TypeMismatch`.
+pub fn bool_details(s: Snapshot, key: Str, ctx: Context, default: Bool) -> Resolved[Bool]
+= do
+  d = evaluate(s, key, ctx)
+  match d.value
+  | some(BoolV{v}) => Resolved{value: v, details: d}
+  | some(_) => Resolved{value: default, details: mismatch(d, "boolean")}
+  | none => Resolved{value: default, details: d}
+
+// A string flag's value and details; `default` on any error.
+pub fn str_details(s: Snapshot, key: Str, ctx: Context, default: Str) -> Resolved[Str]
+= do
+  d = evaluate(s, key, ctx)
+  match d.value
+  | some(StrV{v}) => Resolved{value: v, details: d}
+  | some(_) => Resolved{value: default, details: mismatch(d, "string")}
+  | none => Resolved{value: default, details: d}
+
+// An integer flag's value and details; `default` on any error.
+pub fn int_details(s: Snapshot, key: Str, ctx: Context, default: Int) -> Resolved[Int]
+= do
+  d = evaluate(s, key, ctx)
+  match d.value
+  | some(IntV{v}) => Resolved{value: v, details: d}
+  | some(_) => Resolved{value: default, details: mismatch(d, "integer")}
+  | none => Resolved{value: default, details: d}
+
+// A number flag's value and details (integer variants are accepted as numbers); `default` on any
+// error.
+pub fn num_details(s: Snapshot, key: Str, ctx: Context, default: F64) -> Resolved[F64]
+= do
+  d = evaluate(s, key, ctx)
+  match d.value
+  | some(NumV{v}) => Resolved{value: v, details: d}
+  | some(IntV{v}) => Resolved{value: v.to_f64, details: d}
+  | some(_) => Resolved{value: default, details: mismatch(d, "number")}
+  | none => Resolved{value: default, details: d}
+
+// Whether boolean flag `key` is on for `ctx`; `default` on any error.
+pub fn is_on(s: Snapshot, key: Str, ctx: Context, default: Bool) -> Bool
+= bool_details(s, key, ctx, default).value
+
+// A string flag's value for `ctx`; `default` on any error.
+pub fn str_value(s: Snapshot, key: Str, ctx: Context, default: Str) -> Str
+= str_details(s, key, ctx, default).value
+
+// An integer flag's value for `ctx`; `default` on any error.
+pub fn int_value(s: Snapshot, key: Str, ctx: Context, default: Int) -> Int
+= int_details(s, key, ctx, default).value
+
+// A number flag's value for `ctx`; `default` on any error.
+pub fn num_value(s: Snapshot, key: Str, ctx: Context, default: F64) -> F64
+= num_details(s, key, ctx, default).value
+
+// Every flag of the snapshot evaluated for `ctx`, in key order: what a client-side SDK
+// bootstrap needs.
+pub fn evaluate_all(s: Snapshot, ctx: Context) -> List[Details]
+= s.flags.keys.map(k => evaluate(s, k, ctx))
+
+// ---------- validation ----------
+
+fn valid_key(k: Str) -> Bool
+= k.len >= 1 and k.len <= 128 and k.chars.all(c => c >= "a" and c <= "z" or c >= "A" and c <= "Z" or c >= "0" and c <= "9" or c == "-" or c == "_" or c == "." or c == ":")
+
+fn clause_problems(s: Snapshot, c: Clause, at: Str, in_seg: Bool) -> List[Str]
+= match c
+  | AttrClause{attr, op, values} => do
+    a = if attr == "" then ["{at}.attr: is empty"] else []
+    n = values.len
+    arity = match op
+      | Equals | NotEquals | Lt | Le | Gt | Ge | Before | After => if n == 1 then [] else ["{at}.values: {op_name(op)} takes exactly one value, got {n}"]
+      | Exists | NotExists => if n == 0 then [] else ["{at}.values: {op_name(op)} takes no values"]
+      | _ => if n >= 1 then [] else ["{at}.values: {op_name(op)} needs at least one value"]
+    nums = if (op == Lt or op == Le or op == Gt or op == Ge) and n == 1 and num(values[0]).is_none then ["{at}.values[0]: '{values[0]}' is not a number"] else []
+    times = if (op == Before or op == After) and n == 1 and parse_time(values[0].trim).is_none then ["{at}.values[0]: '{values[0]}' is not an ISO 8601 time"] else []
+    pats = if op == Matches then values.enumerate.flat_map(p => regex_problem(p.1, "{at}.values[{p.0}]")) else []
+    a + arity + nums + times + pats
+  | SegmentClause{segment} => if in_seg then ["{at}: segments may not refer to segments"] else if s.segments.has(segment) then [] else ["{at}: no segment '{segment}'"]
+  | AllClauses{cs} => cs.enumerate.flat_map(p => clause_problems(s, p.1, "{at}.all[{p.0}]", in_seg))
+  | AnyClause{cs} => cs.enumerate.flat_map(p => clause_problems(s, p.1, "{at}.any[{p.0}]", in_seg))
+  | NotClause{c} => clause_problems(s, c, "{at}.negate", in_seg)
+  | AlwaysClause => []
+
+fn regex_problem(p: Str, at: Str) -> List[Str]
+= match regex(p)
+  | ok(_) => []
+  | err(e) => ["{at}: bad regular expression: {e}"]
+
+fn serve_problems(f: Flag, sv: Serve, at: Str) -> List[Str]
+= match sv
+  | Fixed{variant} => if f.variants.any(v => v.0 == variant) then [] else ["{at}.variant: no variant '{variant}'"]
+  | Weighted{weights, bucket_by} => do
+    unknown = weights.filter(w => not f.variants.any(v => v.0 == w.0)).map(w => "{at}.split: no variant '{w.0}'")
+    neg = weights.filter(w => w.1 < 0).map(w => "{at}.split: the weight of '{w.0}' is negative")
+    zero = if weights.map(w => max(0, w.1)).sum == 0 then ["{at}.split: needs a positive weight"] else []
+    dup = if weights.map(_.0).unique.len != weights.len then ["{at}.split: names a variant twice"] else []
+    by = if bucket_by == "" then ["{at}.bucket_by: is empty"] else []
+    unknown + neg + zero + dup + by
+
+fn flag_problems(s: Snapshot, f: Flag) -> List[Str]
+= do
+  at = "flags.{f.key}"
+  key = if valid_key(f.key) then [] else ["{at}: the key must be 1 to 128 letters, digits, '-', '_', '.' or ':'"]
+  vs = if f.variants.is_empty then ["{at}.variants: needs at least one variant"] else []
+  dupv = if f.variants.map(_.0).unique.len != f.variants.len then ["{at}.variants: names a variant twice"] else []
+  types = if f.variants.map(v => type_name(v.1)).unique.len > 1 then ["{at}.variants: all variants must have one type"] else []
+  off = if f.variants.any(v => v.0 == f.off_variant) then [] else ["{at}.off_variant: no variant '{f.off_variant}'"]
+  ft = serve_problems(f, f.fallthrough, "{at}.fallthrough")
+  ts = f.targets.enumerate.flat_map(p => if f.variants.any(v => v.0 == p.1.variant) then [] else ["{at}.targets[{p.0}].variant: no variant '{p.1.variant}'"])
+  rids = if f.rules.map(_.id).unique.len != f.rules.len then ["{at}.rules: two rules have one id"] else []
+  rs = f.rules.enumerate.flat_map(p => clause_problems(s, p.1.when, "{at}.rules[{p.0}].when", false) + serve_problems(f, p.1.serve, "{at}.rules[{p.0}].serve"))
+  ps = f.prerequisites.enumerate.flat_map(p => prereq_problems(s, p.1, "{at}.prerequisites[{p.0}]"))
+  key + vs + dupv + types + off + ft + ts + rids + rs + ps
+
+fn prereq_problems(s: Snapshot, p: Prereq, at: Str) -> List[Str]
+= match s.flags.get(p.flag)
+  | none => ["{at}: no flag '{p.flag}'"]
+  | some(g) => p.variants.filter(v => not g.variants.any(x => x.0 == v)).map(v => "{at}: flag '{p.flag}' has no variant '{v}'")
+
+fn cycle_from(s: Snapshot, key: Str, path: List[Str]) -> Opt[List[Str]]
+= if path.contains(key) then some(path.push(key)) else match s.flags.get(key)
+  | none => none
+  | some(f) => f.prerequisites.fold(none, (found, p) => if found.is_some then found else cycle_from(s, p.flag, path.push(key)))
+
+fn segment_problems(s: Snapshot, seg: Segment) -> List[Str]
+= do
+  at = "segments.{seg.key}"
+  key = if valid_key(seg.key) then [] else ["{at}: the key must be 1 to 128 letters, digits, '-', '_', '.' or ':'"]
+  key + seg.rules.enumerate.flat_map(p => clause_problems(s, p.1, "{at}.rules[{p.0}]", true))
+
+fn cycle_problem(s: Snapshot, k: Str) -> List[Str]
+= match cycle_from(s, k, [])
+  | some(path) => if path.first == some(k) then ["flags.{k}.prerequisites: cycle {path.join(" -> ")}"] else []
+  | none => []
+
+// Every problem in a snapshot, each with its path (`flags.KEY.rules[0].when.values: ...`):
+// unknown variants, segments and prerequisite flags, prerequisite cycles, operator arities, numbers
+// and times that don't parse, bad regular expressions, splits without positive weights, variants
+// of mixed types, duplicate names and keys that aren't allowed. Empty when the snapshot is valid.
+pub fn problems(s: Snapshot) -> List[Str]
+= do
+  fs = s.flags.values.flat_map(f => flag_problems(s, f))
+  cycles = s.flags.keys.flat_map(k => cycle_problem(s, k))
+  segs = s.segments.values.flat_map(g => segment_problems(s, g))
+  fs + cycles + segs
+
+// ---------- the JSON format ----------
+
+// A variant on the wire: its name and exactly one of `boolean`, `string`, `integer`, `number`.
+pub type VariantJson = {name: Str, boolean: Opt[Bool], string: Opt[Str], integer: Opt[Int], number: Opt[F64]} derive Eq, Show
+
+// A clause on the wire: exactly one of an attribute comparison (`attr`, `op`, `values`), `segment`,
+// `all`, `any` or `negate`; `{}` with `always: true` always holds.
+pub type ClauseJson = {attr: Opt[Str], op: Opt[Str], values: Opt[List[Str]], segment: Opt[Str], all: Opt[List[ClauseJson]], any: Opt[List[ClauseJson]], negate: Opt[ClauseJson], always: Opt[Bool]} derive Eq, Show
+
+// A weighted variant of a split on the wire.
+pub type WeightJson = {variant: Str, weight: Int} derive Eq, Show
+
+// A serve on the wire: `variant`, or `split` (with an optional `bucket_by`, default `key`).
+pub type ServeJson = {variant: Opt[Str], split: Opt[List[WeightJson]], bucket_by: Opt[Str]} derive Eq, Show
+
+// A rule on the wire.
+pub type RuleJson = {id: Str, when: ClauseJson, serve: ServeJson} derive Eq, Show
+
+// A flag on the wire. Missing `targets`, `rules`, `prerequisites`, `salt` and `version` are empty
+// (0); a missing `enabled` is true.
+pub type FlagJson = {key: Str, enabled: Opt[Bool], variants: List[VariantJson], off_variant: Str, fallthrough: ServeJson, targets: Opt[List[Target]], rules: Opt[List[RuleJson]], prerequisites: Opt[List[Prereq]], salt: Opt[Str], version: Opt[Int]} derive Eq, Show
+
+// A segment on the wire.
+pub type SegmentJson = {key: Str, included: Opt[List[Str]], excluded: Opt[List[Str]], rules: Opt[List[ClauseJson]]} derive Eq, Show
+
+// A definitions document: `{"flags": [...], "segments": [...]}`.
+pub type DefinitionsJson = {flags: List[FlagJson], segments: Opt[List[SegmentJson]]} derive Eq, Show
+
+// The name of an operator in the JSON format (`equals`, `not_in`, `starts_with`, `lt`, ...).
+pub fn op_name(op: Op) -> Str
+  ex op_name(StartsWith) == "starts_with"
+= match op
+  | Equals => "equals"
+  | NotEquals => "not_equals"
+  | In => "in"
+  | NotIn => "not_in"
+  | Contains => "contains"
+  | NotContains => "not_contains"
+  | StartsWith => "starts_with"
+  | EndsWith => "ends_with"
+  | Lt => "lt"
+  | Le => "le"
+  | Gt => "gt"
+  | Ge => "ge"
+  | Matches => "matches"
+  | Before => "before"
+  | After => "after"
+  | Exists => "exists"
+  | NotExists => "not_exists"
+
+fn all_ops() -> List[Op]
+= [Equals, NotEquals, In, NotIn, Contains, NotContains, StartsWith, EndsWith, Lt, Le, Gt, Ge, Matches, Before, After, Exists, NotExists]
+
+// The operator with this JSON name.
+pub fn parse_op(name: Str) -> Opt[Op]
+  ex parse_op("not_in") == some(NotIn)
+  ex parse_op("eq") == none
+= all_ops().find(o => op_name(o) == name)
+
+type DefErr = BadDefinition{path: Str, msg: Str} derive Eq, Show
+
+fn bad_def(path: Str, msg: Str) -> Unit ! fail[DefErr]
+= raise BadDefinition{path, msg}
+
+fn variant_of(v: VariantJson, at: Str) -> (Str, FlagValue) ! fail[DefErr]
+= do
+  vals = [v.boolean.map(b => BoolV{v: b}), v.string.map(x => StrV{v: x}), v.integer.map(n => IntV{v: n}), v.number.map(x => NumV{v: x})].filter(o => o.is_some).map(o => o.get)
+  if vals.len != 1 then bad_def(at, "a variant has exactly one of boolean, string, integer, number")
+  (v.name, vals[0])
+
+fn clause_of(c: ClauseJson, at: Str) -> Clause ! fail[DefErr]
+= do
+  kinds = [c.attr.is_some, c.segment.is_some, c.all.is_some, c.any.is_some, c.negate.is_some, c.always == some(true)].filter(b => b).len
+  if kinds != 1 then bad_def(at, "a clause has exactly one of attr, segment, all, any, negate, always")
+  if c.attr.is_none and (c.op.is_some or c.values.is_some) then bad_def(at, "op and values belong to an attr clause")
+  match c.attr
+  | some(a) => do
+    some(name) = c.op else raise BadDefinition{path: at + ".op", msg: "is missing"}
+    some(op) = parse_op(name) else raise BadDefinition{path: at + ".op", msg: "unknown operator '{name}'"}
+    AttrClause{attr: a, op, values: c.values.or([])}
+  | none => clause_rest(c, at)
+
+fn clause_rest(c: ClauseJson, at: Str) -> Clause ! fail[DefErr]
+= match (c.segment, c.all, c.any, c.negate)
+  | (some(g), _, _, _) => SegmentClause{segment: g}
+  | (_, some(cs), _, _) => AllClauses{cs: cs.enumerate.map(p => clause_of(p.1, "{at}.all[{p.0}]"))}
+  | (_, _, some(cs), _) => AnyClause{cs: cs.enumerate.map(p => clause_of(p.1, "{at}.any[{p.0}]"))}
+  | (_, _, _, some(n)) => NotClause{c: clause_of(n, at + ".negate")}
+  | _ => AlwaysClause
+
+fn serve_of(s: ServeJson, at: Str) -> Serve ! fail[DefErr]
+= match (s.variant, s.split)
+  | (some(v), none) => do
+    if s.bucket_by.is_some then bad_def(at + ".bucket_by", "belongs to a split")
+    Fixed{variant: v}
+  | (none, some(ws)) => Weighted{weights: ws.map(w => (w.variant, w.weight)), bucket_by: s.bucket_by.or("key")}
+  | _ => do
+    bad_def(at, "a serve has exactly one of variant, split")
+    Fixed{variant: ""}
+
+fn flag_of(f: FlagJson, at: Str) -> Flag ! fail[DefErr]
+= Flag{key: f.key, enabled: f.enabled.or(true), variants: f.variants.enumerate.map(p => variant_of(p.1, "{at}.variants[{p.0}]")), off_variant: f.off_variant, fallthrough: serve_of(f.fallthrough, at + ".fallthrough"), targets: f.targets.or([]), rules: f.rules.or([]).enumerate.map(p => Rule{id: p.1.id, when: clause_of(p.1.when, "{at}.rules[{p.0}].when"), serve: serve_of(p.1.serve, "{at}.rules[{p.0}].serve")}), prerequisites: f.prerequisites.or([]), salt: f.salt.or(""), version: f.version.or(0)}
+
+fn segment_of(s: SegmentJson, at: Str) -> Segment ! fail[DefErr]
+= Segment{key: s.key, included: s.included.or([]), excluded: s.excluded.or([]), rules: s.rules.or([]).enumerate.map(p => clause_of(p.1, "{at}.rules[{p.0}]"))}
+
+fn duplicates(keys: List[Str]) -> List[Str]
+= keys.counts.filter(p => p.1 > 1).map(p => p.0)
+
+// The snapshot a definitions document describes, validated (see `problems`). Errors name the
+// path: `flags[1].rules[0].when.op: unknown operator 'eqals'`. Flags and segments must have unique
+// keys.
+pub fn decode(text: Str) -> Res[Snapshot, Str]
+= match json.decode[DefinitionsJson](text)
+  | err(e) => err(e)
+  | ok(d) => definitions(d)
+
+fn definitions(d: DefinitionsJson) -> Res[Snapshot, Str]
+= catch do
+  fs = d.flags.enumerate.map(p => flag_of(p.1, "flags[{p.0}]"))
+  gs = d.segments.or([]).enumerate.map(p => segment_of(p.1, "segments[{p.0}]"))
+  dupf = duplicates(fs.map(_.key))
+  dupg = duplicates(gs.map(_.key))
+  if not dupf.is_empty then bad_def("flags", "the key '{dupf[0]}' is used twice")
+  if not dupg.is_empty then bad_def("segments", "the key '{dupg[0]}' is used twice")
+  s = snapshot(fs, gs)
+  ps = problems(s)
+  if ps.is_empty then ok(s) else err(ps.join("; "))
+  | BadDefinition{path, msg} => err("{path}: {msg}")
+
+fn variant_json(v: (Str, FlagValue)) -> VariantJson
+= match v.1
+  | BoolV{v: b} => VariantJson{name: v.0, boolean: some(b), string: none, integer: none, number: none}
+  | StrV{v: x} => VariantJson{name: v.0, boolean: none, string: some(x), integer: none, number: none}
+  | IntV{v: n} => VariantJson{name: v.0, boolean: none, string: none, integer: some(n), number: none}
+  | NumV{v: x} => VariantJson{name: v.0, boolean: none, string: none, integer: none, number: some(x)}
+
+fn empty_clause() -> ClauseJson
+= ClauseJson{attr: none, op: none, values: none, segment: none, all: none, any: none, negate: none, always: none}
+
+fn clause_json(c: Clause) -> ClauseJson
+= match c
+  | AttrClause{attr, op, values} => empty_clause() with attr := some(attr), op := some(op_name(op)), values := some(values)
+  | SegmentClause{segment} => empty_clause() with segment := some(segment)
+  | AllClauses{cs} => empty_clause() with all := some(cs.map(x => clause_json(x)))
+  | AnyClause{cs} => empty_clause() with any := some(cs.map(x => clause_json(x)))
+  | NotClause{c} => empty_clause() with negate := some(clause_json(c))
+  | AlwaysClause => empty_clause() with always := some(true)
+
+fn serve_json(s: Serve) -> ServeJson
+= match s
+  | Fixed{variant} => ServeJson{variant: some(variant), split: none, bucket_by: none}
+  | Weighted{weights, bucket_by} => ServeJson{variant: none, split: some(weights.map(w => WeightJson{variant: w.0, weight: w.1})), bucket_by: some(bucket_by)}
+
+fn flag_json(f: Flag) -> FlagJson
+= FlagJson{key: f.key, enabled: some(f.enabled), variants: f.variants.map(variant_json), off_variant: f.off_variant, fallthrough: serve_json(f.fallthrough), targets: some(f.targets), rules: some(f.rules.map(r => RuleJson{id: r.id, when: clause_json(r.when), serve: serve_json(r.serve)})), prerequisites: some(f.prerequisites), salt: some(f.salt), version: some(f.version)}
+
+fn segment_json(s: Segment) -> SegmentJson
+= SegmentJson{key: s.key, included: some(s.included), excluded: some(s.excluded), rules: some(s.rules.map(x => clause_json(x)))}
+
+// The definitions document of a snapshot; `decode` reads it back to the same flags and
+// segments.
+pub fn encode(s: Snapshot) -> Str
+= json.encode(DefinitionsJson{flags: s.flags.values.map(flag_json), segments: some(s.segments.values.map(segment_json))})
+
+// One flag as JSON in the definitions format.
+pub fn encode_flag(f: Flag) -> Str
+= json.encode(flag_json(f))
+
+// One segment as JSON in the definitions format.
+pub fn encode_segment(s: Segment) -> Str
+= json.encode(segment_json(s))
+
+// A flag from its JSON (one element of `flags`), checked on its own: references to other flags
+// and segments are checked when it joins a snapshot.
+pub fn decode_flag(text: Str) -> Res[Flag, Str]
+= match json.decode[FlagJson](text)
+  | err(e) => err(e)
+  | ok(f) => flag_res(f)
+
+fn flag_res(f: FlagJson) -> Res[Flag, Str]
+= catch ok(flag_of(f, "flag"))
+  | BadDefinition{path, msg} => err("{path}: {msg}")
+
+// A segment from its JSON (one element of `segments`).
+pub fn decode_segment(text: Str) -> Res[Segment, Str]
+= match json.decode[SegmentJson](text)
+  | err(e) => err(e)
+  | ok(s) => segment_res(s)
+
+fn segment_res(s: SegmentJson) -> Res[Segment, Str]
+= catch ok(segment_of(s, "segment"))
+  | BadDefinition{path, msg} => err("{path}: {msg}")
+
+// The definitions in a JSON file, validated.
+pub fn load_file(path: Str) -> Res[Snapshot, Str] ! fs
+= match read_file(path)
+  | err(e) => err(e)
+  | ok(text) => decode(text)
+
+// A fingerprint of a snapshot's definitions (the SHA-256 of their JSON, in hex): equal snapshots
+// have equal fingerprints, so a poller can tell whether anything changed.
+pub fn fingerprint(s: Snapshot) -> Str
+  post r.len == 64
+= crypto.sha256(encode(s)).hex
+
+// ---------- the SQLite store ----------
+
+// Why a store change was refused: the change would make the definitions invalid, the flag or
+// segment changed since the version the caller read (`expected`), or it does not exist. The
+// variant names answer 400, 409 and 404 when an `http.serve` handler raises them.
+pub type StoreErr = Invalid{msg: Str} | Conflict{key: Str, expected: Int, actual: Int} | NotFound{key: Str} derive Eq, Show
+
+// One entry of the audit history: what changed (`flag` or `segment`, its key), the action (`put`
+// or `delete`), the definition after a put, the store version it produced, who did it and when.
+pub type AuditEntry = {id: Int, kind: Str, key: Str, action: Str, definition: Opt[Str], version: Int, actor: Str, at: Time} derive Eq, Show
+
+type DefRow = {key: Str, definition: Str, version: Int}
+
+fn schema() -> List[Str]
+= ["create table if not exists featureflags_flags (key text primary key, definition text not null, version integer not null)", "create table if not exists featureflags_segments (key text primary key, definition text not null, version integer not null)", "create table if not exists featureflags_audit (id integer primary key, kind text not null, key text not null, action text not null, definition text, version integer not null, actor text not null, at text not null)", "create index if not exists featureflags_audit_key on featureflags_audit (kind, key, id)", "create table if not exists featureflags_meta (id integer primary key check (id = 1), version integer not null)", "insert or ignore into featureflags_meta (id, version) values (1, 0)"]
+
+// Creates the store's tables if they are missing (`featureflags_flags`, `featureflags_segments`,
+// `featureflags_audit`, `featureflags_meta`). Safe to call on every start.
+pub fn open_store(c: Db) -> Unit ! db, fail[DbErr]
+= db.tx(c, () => do
+  for s in schema()
+    n = db.exec(c, s)
+  ())
+
+// The store's version: it increases by one with every change, so comparing it with a snapshot's
+// `version` is the cheap way to tell whether to reload.
+pub fn store_version(c: Db) -> Int ! db, fail[DbErr]
+= db.one[Int](c, "select version from featureflags_meta where id = 1", [])
+
+fn stored_flag(r: DefRow) -> Flag ! fail[StoreErr]
+= match decode_flag(r.definition)
+  | ok(f) => f with version := r.version
+  | err(e) => raise Invalid{msg: "stored flag '{r.key}': {e}"}
+
+fn stored_segment(r: DefRow) -> Segment ! fail[StoreErr]
+= match decode_segment(r.definition)
+  | ok(g) => g
+  | err(e) => raise Invalid{msg: "stored segment '{r.key}': {e}"}
+
+fn load_segment(c: Db, m: Map[Str, Segment], g: Str) -> Map[Str, Segment] ! db, fail[DbErr], fail[StoreErr]
+= match db.opt[DefRow](c, "select key, definition, version from featureflags_segments where key = ?", [g])
+  | some(row) => m.put(g, stored_segment(row))
+  | none => m
+
+fn read_all(c: Db) -> Snapshot ! db, fail[DbErr], fail[StoreErr]
+= do
+  v = store_version(c)
+  fs = db.query[DefRow](c, "select key, definition, version from featureflags_flags order by key", []).map(stored_flag)
+  gs = db.query[DefRow](c, "select key, definition, version from featureflags_segments order by key", []).map(stored_segment)
+  snapshot(fs, gs) with version := v
+
+// Every flag and segment in the store, as a snapshot with the store's version. Read in one
+// transaction, so it is consistent.
+pub fn load_store(c: Db) -> Snapshot ! db, fail[DbErr], fail[StoreErr]
+= db.tx(c, () => read_all(c))
+
+// The store's snapshot if its version differs from `have`, else none: a poll costs one indexed
+// read when nothing changed.
+pub fn reload_if_changed(c: Db, have: Int) -> Opt[Snapshot] ! db, fail[DbErr], fail[StoreErr]
+= if store_version(c) == have then none else some(load_store(c))
+
+fn bump(c: Db, kind: Str, key: Str, action: Str, definition: Opt[Str], actor: Str, at: Time) -> Int ! db, fail[DbErr]
+= do
+  n = db.exec(c, "update featureflags_meta set version = version + 1 where id = 1")
+  v = store_version(c)
+  m = db.exec(c, "insert into featureflags_audit (kind, key, action, definition, version, actor, at) values (?, ?, ?, ?, ?, ?, ?)", [kind, key, action, definition, v, actor, at])
+  v
+
+fn check_snapshot(s: Snapshot) -> Unit ! fail[StoreErr]
+= do
+  ps = problems(s)
+  if not ps.is_empty then raise Invalid{msg: ps.join("; ")}
+
+fn current(c: Db, table: Str, key: Str) -> Int ! db, fail[DbErr]
+= db.opt[Int](c, "select version from {table} where key = ?", [key]).or(0)
+
+fn expect(key: Str, expected: Opt[Int], actual: Int) -> Unit ! fail[StoreErr]
+= match expected
+  | some(e) => if e != actual then raise Conflict{key, expected: e, actual}
+  | none => ()
+
+// Creates or replaces flag `f`, in a transaction: the whole store must stay valid with it. With
+// `expected` (the flag's version the caller read, 0 for a new flag) a concurrent change is a
+// `Conflict` instead of being overwritten. Returns the flag as stored, with its new version.
+pub fn put_flag(c: Db, f: Flag, expected: Opt[Int], actor: Str, at: Time) -> Flag ! db, fail[DbErr], fail[StoreErr]
+= db.tx(c, () => do
+  have = current(c, "featureflags_flags", f.key)
+  expect(f.key, expected, have)
+  s = read_all(c)
+  stored = f with version := have + 1
+  check_snapshot(s with flags := s.flags.put(f.key, stored))
+  text = encode_flag(stored)
+  n = db.exec(c, "insert into featureflags_flags (key, definition, version) values (?, ?, ?) on conflict (key) do update set definition = excluded.definition, version = excluded.version", [f.key, text, stored.version])
+  v = bump(c, "flag", f.key, "put", some(text), actor, at)
+  stored)
+
+// Deletes flag `key`; refused while another flag has it as a prerequisite.
+pub fn delete_flag(c: Db, key: Str, expected: Opt[Int], actor: Str, at: Time) -> Unit ! db, fail[DbErr], fail[StoreErr]
+= db.tx(c, () => do
+  have = current(c, "featureflags_flags", key)
+  if have == 0 then raise NotFound{key}
+  expect(key, expected, have)
+  s = read_all(c)
+  check_snapshot(s with flags := s.flags.remove(key))
+  n = db.exec(c, "delete from featureflags_flags where key = ?", [key])
+  v = bump(c, "flag", key, "delete", none, actor, at)
+  ())
+
+// Creates or replaces segment `g`; the store must stay valid with it.
+pub fn put_segment(c: Db, g: Segment, expected: Opt[Int], actor: Str, at: Time) -> Int ! db, fail[DbErr], fail[StoreErr]
+= db.tx(c, () => do
+  have = current(c, "featureflags_segments", g.key)
+  expect(g.key, expected, have)
+  s = read_all(c)
+  check_snapshot(s with segments := s.segments.put(g.key, g))
+  text = encode_segment(g)
+  n = db.exec(c, "insert into featureflags_segments (key, definition, version) values (?, ?, ?) on conflict (key) do update set definition = excluded.definition, version = excluded.version", [g.key, text, have + 1])
+  v = bump(c, "segment", g.key, "put", some(text), actor, at)
+  have + 1)
+
+// Deletes segment `key`; refused while a flag uses it.
+pub fn delete_segment(c: Db, key: Str, expected: Opt[Int], actor: Str, at: Time) -> Unit ! db, fail[DbErr], fail[StoreErr]
+= db.tx(c, () => do
+  have = current(c, "featureflags_segments", key)
+  if have == 0 then raise NotFound{key}
+  expect(key, expected, have)
+  s = read_all(c)
+  check_snapshot(s with segments := s.segments.remove(key))
+  n = db.exec(c, "delete from featureflags_segments where key = ?", [key])
+  v = bump(c, "segment", key, "delete", none, actor, at)
+  ())
+
+// Replaces everything in the store with the snapshot's flags and segments (keeping each flag's
+// version counting), in one transaction, with one audit entry per change. Returns the new store
+// version.
+pub fn import_snapshot(c: Db, s: Snapshot, actor: Str, at: Time) -> Int ! db, fail[DbErr], fail[StoreErr]
+= db.tx(c, () => do
+  check_snapshot(s)
+  old = read_all(c)
+  for k in old.flags.keys
+    if not s.flags.has(k) then do
+      n = db.exec(c, "delete from featureflags_flags where key = ?", [k])
+      v = bump(c, "flag", k, "delete", none, actor, at)
+  for k in old.segments.keys
+    if not s.segments.has(k) then do
+      n = db.exec(c, "delete from featureflags_segments where key = ?", [k])
+      v = bump(c, "segment", k, "delete", none, actor, at)
+  for g in s.segments.values
+    if old.segments.get(g.key) != some(g) then do
+      ver = current(c, "featureflags_segments", g.key) + 1
+      text = encode_segment(g)
+      n = db.exec(c, "insert into featureflags_segments (key, definition, version) values (?, ?, ?) on conflict (key) do update set definition = excluded.definition, version = excluded.version", [g.key, text, ver])
+      v = bump(c, "segment", g.key, "put", some(text), actor, at)
+  for f in s.flags.values
+    if old.flags.get(f.key).map(o => o with version := 0) != some(f with version := 0) then do
+      ver = current(c, "featureflags_flags", f.key) + 1
+      text = encode_flag(f with version := ver)
+      n = db.exec(c, "insert into featureflags_flags (key, definition, version) values (?, ?, ?) on conflict (key) do update set definition = excluded.definition, version = excluded.version", [f.key, text, ver])
+      v = bump(c, "flag", f.key, "put", some(text), actor, at)
+  store_version(c))
+
+// The audit history of one flag or segment (`kind` is `flag` or `segment`), oldest first.
+pub fn history(c: Db, kind: Str, key: Str) -> List[AuditEntry] ! db, fail[DbErr]
+= db.query[AuditEntry](c, "select id, kind, key, action, definition, version, actor, at from featureflags_audit where kind = ? and key = ? order by id", [kind, key])
+
+// The audit entries after store version `since`, oldest first: what changed since a snapshot.
+pub fn changes_since(c: Db, since: Int) -> List[AuditEntry] ! db, fail[DbErr]
+= db.query[AuditEntry](c, "select id, kind, key, action, definition, version, actor, at from featureflags_audit where version > ? order by id", [since])
+
+// Evaluates flag `key` straight from the store, reading only that flag, its prerequisites and the
+// segments they use: cheap enough for every request of a handler that shares the `Db`.
+pub fn evaluate_stored(c: Db, key: Str, ctx: Context) -> Details ! db, fail[DbErr], fail[StoreErr]
+= db.tx(c, () => evaluate(partial(c, [key], snapshot([], [])), key, ctx))
+
+fn segment_refs(cl: Clause) -> List[Str]
+= match cl
+  | SegmentClause{segment} => [segment]
+  | AllClauses{cs} => cs.flat_map(x => segment_refs(x))
+  | AnyClause{cs} => cs.flat_map(x => segment_refs(x))
+  | NotClause{c} => segment_refs(c)
+  | _ => []
+
+fn partial(c: Db, todo: List[Str], acc: Snapshot) -> Snapshot ! db, fail[DbErr], fail[StoreErr]
+= match todo
+  | [] => acc
+  | [k, ..rest] => if acc.flags.has(k) then partial(c, rest, acc) else match db.opt[DefRow](c, "select key, definition, version from featureflags_flags where key = ?", [k])
+    | none => partial(c, rest, acc)
+    | some(r) => do
+      f = stored_flag(r)
+      segs = f.rules.flat_map(x => segment_refs(x.when)).unique.filter(g => not acc.segments.has(g))
+      loaded = segs.fold(acc.segments, (m, g) => load_segment(c, m, g))
+      partial(c, rest + f.prerequisites.map(_.flag), acc with flags := acc.flags.put(k, f), segments := loaded)
+
+// ---------- tests ----------
+
+fn ctx(key: Str, attrs: List[(Str, Str)]) -> Context
+= attrs.fold(context(key), (c, a) => with_attr(c, a.0, a.1))
+
+fn holds1(op: Op, v: Str, values: List[Str]) -> Bool
+= clause_holds(snapshot([], []), AttrClause{attr: "a", op, values}, ctx("u", [("a", v)]))
+
+fn missing(op: Op, values: List[Str]) -> Bool
+= clause_holds(snapshot([], []), AttrClause{attr: "a", op, values}, context("u"))
+
+test value_types = type_name(StrV{v: ""}) == "string" and type_name(IntV{v: 1}) == "integer" and type_name(NumV{v: 1.0}) == "number"
+
+test attributes = attr(ctx("u", [("key", "other")]), "key") == some("other") and attr(ctx("u", [("plan", "pro")]), "plan") == some("pro") and attr(context("u"), "plan") == none and with_attr(context("u"), "a", "1").attrs.get("a") == some("1")
+
+test op_equality = holds1(Equals, "x", ["x"]) and not holds1(Equals, "x", ["X"]) and not holds1(Equals, "x", ["x", "y"]) and holds1(NotEquals, "x", ["y"]) and not holds1(NotEquals, "x", ["x"]) and holds1(In, "b", ["a", "b"]) and not holds1(In, "c", ["a", "b"]) and holds1(NotIn, "c", ["a", "b"]) and not holds1(NotIn, "a", ["a"])
+
+test op_strings = holds1(Contains, "hello world", ["xyz", "lo w"]) and not holds1(Contains, "hello", ["z"]) and holds1(NotContains, "hello", ["z"]) and not holds1(NotContains, "hello", ["ell"]) and holds1(StartsWith, "admin@x", ["root", "admin"]) and not holds1(StartsWith, "x", ["y"]) and holds1(EndsWith, "a@corp.com", ["@corp.com"]) and not holds1(EndsWith, "a@corp.co", ["@corp.com"])
+
+test op_numbers = holds1(Lt, "9", ["10"]) and not holds1(Lt, "10", ["10"]) and holds1(Le, "10", ["10.0"]) and holds1(Gt, "2.5", ["2"]) and not holds1(Gt, "abc", ["1"]) and holds1(Ge, " 3 ", ["3"]) and not holds1(Lt, "1", ["x"]) and holds1(Lt, "-1e3", ["0"])
+
+test op_times = holds1(Before, "2026-01-01T00:00:00Z", ["2026-06-01T00:00:00Z"]) and not holds1(Before, "2026-07-01T00:00:00Z", ["2026-06-01T00:00:00Z"]) and holds1(After, "2026-07-01T00:00:00Z", ["2026-06-01T00:00:00Z"]) and not holds1(After, "not a time", ["2026-06-01T00:00:00Z"])
+
+test op_regex = holds1(Matches, "user-1234", ["^user-\\d+$"]) and not holds1(Matches, "user-x", ["^user-\\d+$"]) and not holds1(Matches, "x", ["(unclosed"]) and holds1(Matches, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaab", ["^(a+)+b$"])
+
+test op_presence = holds1(Exists, "", []) and not holds1(NotExists, "x", []) and missing(NotExists, []) and not missing(Exists, []) and not missing(NotEquals, ["x"]) and not missing(NotIn, ["x"]) and not missing(NotContains, ["x"]) and not missing(Equals, [""])
+
+test combinators = do
+  s = snapshot([], [])
+  c = ctx("u", [("a", "1")])
+  yes = AttrClause{attr: "a", op: Equals, values: ["1"]}
+  no = AttrClause{attr: "a", op: Equals, values: ["2"]}
+  clause_holds(s, AllClauses{cs: []}, c) and not clause_holds(s, AnyClause{cs: []}, c) and clause_holds(s, AllClauses{cs: [yes, NotClause{c: no}]}, c) and not clause_holds(s, AllClauses{cs: [yes, no]}, c) and clause_holds(s, AnyClause{cs: [no, yes]}, c) and clause_holds(s, AlwaysClause, c)
+
+fn beta() -> Segment
+= Segment{key: "beta", included: ["vip"], excluded: ["banned"], rules: [AttrClause{attr: "email", op: EndsWith, values: ["@example.com"]}]}
+
+test segments = do
+  s = snapshot([], [beta(), Segment{key: "loop", included: [], excluded: [], rules: [SegmentClause{segment: "loop"}]}])
+  seg = SegmentClause{segment: "beta"}
+  clause_holds(s, seg, context("vip")) and clause_holds(s, seg, ctx("a", [("email", "a@example.com")])) and not clause_holds(s, seg, ctx("banned", [("email", "b@example.com")])) and not clause_holds(s, seg, context("x")) and not clause_holds(s, SegmentClause{segment: "nope"}, context("vip")) and not clause_holds(s, SegmentClause{segment: "loop"}, context("x")) and in_segment(s, beta(), context("vip"))
+
+test bucket_is_stable = bucket("f", "", "user-1") == bucket("f", "", "user-1") and bucket("f", "", "user-1") != bucket("g", "", "user-1") and bucket("f", "s2", "user-1") != bucket("f", "", "user-1") and bucket("f", "", "user-1") == bucket_of_reference()
+
+fn bucket_of_reference() -> Int
+= do
+  b = crypto.sha256("f..user-1").to_list
+  (b[0] * 16777216 + b[1] * 65536 + b[2] * 256 + b[3]) * 100000 / 4294967296
+
+test bucket_distribution = do
+  bs = (0..20000).map(i => bucket("checkout", "", "user-{i}"))
+  deciles = (0..10).map(d => bs.filter(b => b / 10000 == d).len)
+  bs.all(b => b >= 0 and b < 100000) and deciles.all(n => n > 1800 and n < 2200)
+
+test rollout_fraction_and_monotonic = do
+  f10 = bool_flag("new-ui", true).with_fallthrough(rollout("on", "off", 10.0))
+  f30 = f10.with_fallthrough(rollout("on", "off", 30.0))
+  s10 = snapshot([f10], [])
+  s30 = snapshot([f30], [])
+  keys = (0..5000).map(i => "u{i}")
+  on10 = keys.filter(k => is_on(s10, "new-ui", context(k), false))
+  on30 = keys.filter(k => is_on(s30, "new-ui", context(k), false))
+  on10.len > 400 and on10.len < 600 and on30.len > 1350 and on30.len < 1650 and on10.all(k => on30.contains(k))
+
+test splits = split_variant([("a", 0), ("b", 0)], 5) == none and split_variant([("a", -5), ("b", 1)], 0) == some("b") and split_variant([("a", 1), ("b", 1)], 99999) == some("b") and split_variant([("a", 1), ("b", 1)], 0) == some("a") and split_variant([("a", 50), ("b", 50)], 50000) == some("b") and split_variant([], 0) == none
+
+test rollout_bounds = rollout("on", "off", 0.0) == Weighted{weights: [("on", 0), ("off", 100000)], bucket_by: "key"} and rollout("on", "off", 100.0) == Weighted{weights: [("on", 100000), ("off", 0)], bucket_by: "key"} and rollout("y", "n", 0.001) == Weighted{weights: [("y", 1), ("n", 99999)], bucket_by: "key"}
+
+fn colors() -> Flag
+= string_flag("color", true, [("red", "#f00"), ("blue", "#00f"), ("green", "#0f0")], "red", "red").add_target("green", ["tester"]).add_rule(rule("eu", "country", In, ["DE", "FR"], Fixed{variant: "blue"})).add_rule(Rule{id: "beta", when: SegmentClause{segment: "beta"}, serve: Weighted{weights: [("blue", 1), ("green", 1)], bucket_by: "key"}})
+
+fn flags() -> Snapshot
+= snapshot([colors(), bool_flag("plain", true), bool_flag("dark", false), bool_flag("needs", true).add_prereq("color", ["blue"]), bool_flag("needs-missing", true).add_prereq("ghost", ["on"]), bool_flag("cyc-a", true).add_prereq("cyc-b", ["on"]), bool_flag("cyc-b", true).add_prereq("cyc-a", ["on"]), Flag{key: "limit", enabled: true, variants: [("low", IntV{v: 10}), ("high", IntV{v: 100})], off_variant: "low", fallthrough: Fixed{variant: "high"}, targets: [], rules: [], prerequisites: [], salt: "", version: 3}, Flag{key: "ratio", enabled: true, variants: [("x", NumV{v: 0.25})], off_variant: "x", fallthrough: Fixed{variant: "x"}, targets: [], rules: [], prerequisites: [], salt: "", version: 0}, Flag{key: "broken", enabled: true, variants: [("a", BoolV{v: true})], off_variant: "a", fallthrough: Fixed{variant: "zzz"}, targets: [], rules: [], prerequisites: [], salt: "", version: 0}, bool_flag("split-attr", true).with_fallthrough(Weighted{weights: [("on", 1), ("off", 1)], bucket_by: "org"})], [beta()])
+
+test reasons_static_default_disabled = do
+  s = flags()
+  p = evaluate(s, "plain", context("u"))
+  d = evaluate(s, "dark", context("u"))
+  c = evaluate(s, "color", ctx("u", [("country", "US")]))
+  p.reason == Static and p.value == some(BoolV{v: true}) and p.variant == some("on") and d.reason == Disabled and d.value == some(BoolV{v: false}) and c.reason == Default and c.variant == some("red") and c.rule == none
+
+test reasons_targeting = do
+  s = flags()
+  eu = evaluate(s, "color", ctx("u", [("country", "FR")]))
+  t = evaluate(s, "color", ctx("tester", [("country", "FR")]))
+  b = evaluate(s, "color", context("vip"))
+  eu.reason == TargetingMatch and eu.rule == some("eu") and eu.value == some(StrV{v: "#00f"}) and t.variant == some("green") and t.rule == some("target:green") and b.reason == Split and b.rule == some("beta") and ["blue", "green"].contains(b.variant.or(""))
+
+test prerequisites = do
+  s = flags()
+  ok_ = evaluate(s, "needs", ctx("u", [("country", "DE")]))
+  no = evaluate(s, "needs", ctx("u", [("country", "US")]))
+  ghost = evaluate(s, "needs-missing", context("u"))
+  cyc = evaluate(s, "cyc-a", context("u"))
+  ok_.reason == Static and ok_.variant == some("on") and no.reason == PrerequisiteFailed and no.variant == some("off") and no.rule == some("prerequisite:color") and ghost.reason == PrerequisiteFailed and cyc.reason == ErrorReason and cyc.error == some(General) and cyc.message.contains("cycle")
+
+test errors = do
+  s = flags()
+  nf = evaluate(s, "nope", context("u"))
+  bad = evaluate(s, "broken", context("u"))
+  nokey = evaluate(s, "split-attr", context("u"))
+  withkey = evaluate(s, "split-attr", ctx("u", [("org", "acme")]))
+  nf.error == some(FlagNotFound) and nf.reason == ErrorReason and nf.value == none and bad.error == some(General) and nokey.error == some(TargetingKeyMissing) and withkey.reason == Split and evaluate(s, "split-attr", ctx("u", [("org", "acme")])) == withkey
+
+test typed_values = do
+  s = flags()
+  u = context("u")
+  mm = bool_details(s, "color", u, true)
+  is_on(s, "plain", u, false) and not is_on(s, "nope", u, false) and is_on(s, "nope", u, true) and mm.value and mm.details.error == some(TypeMismatch) and mm.details.message == "the flag is string, not boolean" and str_value(s, "color", u, "x") == "#f00" and str_value(s, "plain", u, "x") == "x" and int_value(s, "limit", u, 0) == 100 and int_value(s, "plain", u, 7) == 7 and num_value(s, "ratio", u, 0.0) == 0.25 and num_value(s, "limit", u, 0.0) == 100.0 and num_value(s, "color", u, 1.5) == 1.5 and str_details(s, "color", u, "").details.flag_version == 0 and int_details(s, "limit", u, 0).details.flag_version == 3 and num_details(s, "nope", u, 2.0).value == 2.0
+
+test evaluate_everything = do
+  all = evaluate_all(flags(), context("u"))
+  all.len == 11 and all.map(_.key) == all.map(_.key).sort
+
+test names_of_reasons = [Static, Default, TargetingMatch, Split, Disabled, PrerequisiteFailed, ErrorReason].map(reason_name) == ["STATIC", "DEFAULT", "TARGETING_MATCH", "SPLIT", "DISABLED", "PREREQUISITE_FAILED", "ERROR"] and [FlagNotFound, TypeMismatch, ParseError, TargetingKeyMissing, InvalidContext, General].map(error_name) == ["FLAG_NOT_FOUND", "TYPE_MISMATCH", "PARSE_ERROR", "TARGETING_KEY_MISSING", "INVALID_CONTEXT", "GENERAL"]
+
+test op_names_round_trip = all_ops().all(o => parse_op(op_name(o)) == some(o)) and all_ops().map(op_name).unique.len == 17
+
+test validation = do
+  s = flags()
+  ps = problems(s)
+  ps.contains("flags.broken.fallthrough.variant: no variant 'zzz'") and ps.contains("flags.cyc-a.prerequisites: cycle cyc-a -> cyc-b -> cyc-a") and ps.contains("flags.needs-missing.prerequisites[0]: no flag 'ghost'") and ps.len == 4
+
+test validation_details = do
+  f = Flag{key: "bad key!", enabled: true, variants: [("a", BoolV{v: true}), ("a", StrV{v: "x"})], off_variant: "z", fallthrough: Weighted{weights: [("a", -1), ("q", 0)], bucket_by: ""}, targets: [Target{variant: "q", keys: ["u"]}], rules: [rule("r", "n", Lt, ["x"], Fixed{variant: "a"}), rule("r", "n", Equals, [], Fixed{variant: "a"}), rule("t", "n", Matches, ["("], Fixed{variant: "a"}), rule("u", "n", Exists, ["x"], Fixed{variant: "a"}), rule("v", "n", Before, ["soon"], Fixed{variant: "a"}), rule("w", "", In, [], Fixed{variant: "a"}), Rule{id: "x", when: SegmentClause{segment: "none"}, serve: Fixed{variant: "a"}}], prerequisites: [], salt: "", version: 0}
+  g = Segment{key: "g", included: [], excluded: [], rules: [SegmentClause{segment: "g"}]}
+  ps = problems(snapshot([f, bool_flag("p", true).add_prereq("bad key!", ["nope"])], [g]))
+  expect = ["the key must be", "names a variant twice", "one type", "off_variant: no variant 'z'", "weight of 'a' is negative", "no variant 'q'", "needs a positive weight", "bucket_by: is empty", "targets[0].variant", "two rules have one id", "'x' is not a number", "takes exactly one value, got 0", "bad regular expression", "takes no values", "not an ISO 8601 time", "attr: is empty", "needs at least one value", "no segment 'none'", "segments may not refer to segments", "has no variant 'nope'"]
+  expect.all(e => ps.any(p => p.contains(e)))
+
+fn doc() -> Str
+= "\{\"flags\": [\{\"key\": \"checkout\", \"variants\": [\{\"name\": \"on\", \"boolean\": true}, \{\"name\": \"off\", \"boolean\": false}], \"off_variant\": \"off\", \"fallthrough\": \{\"split\": [\{\"variant\": \"on\", \"weight\": 20}, \{\"variant\": \"off\", \"weight\": 80}]}, \"targets\": [\{\"variant\": \"off\", \"keys\": [\"blocked\"]}], \"rules\": [\{\"id\": \"staff\", \"when\": \{\"any\": [\{\"segment\": \"staff\"}, \{\"attr\": \"plan\", \"op\": \"in\", \"values\": [\"enterprise\"]}]}, \"serve\": \{\"variant\": \"on\"}}, \{\"id\": \"never\", \"when\": \{\"negate\": \{\"always\": true}}, \"serve\": \{\"variant\": \"off\"}}]}, \{\"key\": \"theme\", \"enabled\": false, \"variants\": [\{\"name\": \"dark\", \"string\": \"dark\"}], \"off_variant\": \"dark\", \"fallthrough\": \{\"variant\": \"dark\"}, \"prerequisites\": [\{\"flag\": \"checkout\", \"variants\": [\"on\"]}]}], \"segments\": [\{\"key\": \"staff\", \"rules\": [\{\"attr\": \"email\", \"op\": \"ends_with\", \"values\": [\"@corp.example\"]}]}]}"
+
+test decode_document = match decode(doc())
+  | ok(s) => s.flags.len == 2 and s.segments.len == 1 and is_on(s, "checkout", ctx("x", [("email", "a@corp.example")]), false) and is_on(s, "checkout", ctx("x", [("plan", "enterprise")]), false) and not is_on(s, "checkout", ctx("blocked", [("plan", "enterprise")]), true) and evaluate(s, "theme", context("x")).reason == Disabled and s.flags.get("checkout").map(f => f.enabled) == some(true)
+  | err(_) => false
+
+test encode_round_trip = match decode(doc())
+  | ok(s) => decode(encode(s)) == ok(s) and decode(encode(flags() with flags := flags().flags.remove("broken").remove("cyc-a").remove("cyc-b").remove("needs-missing"))) == ok(flags() with flags := flags().flags.remove("broken").remove("cyc-a").remove("cyc-b").remove("needs-missing"))
+  | err(_) => false
+
+fn decode_err(text: Str) -> Str
+= match decode(text)
+  | ok(_) => ""
+  | err(e) => e
+
+test decode_errors = decode_err(doc().replace("\"in\"", "\"inn\"")) == "flags[0].rules[0].when.any[1].op: unknown operator 'inn'" and decode_err(doc().replace("\{\"segment\": \"staff\"}", "\{\"segment\": \"staff\", \"always\": true}")) == "flags[0].rules[0].when.any[0]: a clause has exactly one of attr, segment, all, any, negate, always" and decode_err(doc().replace("\"boolean\": true}", "\"boolean\": true, \"string\": \"x\"}")) == "flags[0].variants[0]: a variant has exactly one of boolean, string, integer, number" and decode_err(doc().replace("\"serve\": \{\"variant\": \"on\"}", "\"serve\": \{}")) == "flags[0].rules[0].serve: a serve has exactly one of variant, split" and decode_err("\{\"flags\": [\{\"key\": 1}]}").starts_with("flags[0].key") and decode_err("not json") != "" and decode_err(doc().replace("\"key\": \"theme\"", "\"key\": \"checkout\"")) == "flags: the key 'checkout' is used twice" and decode_err(doc().replace("\"staff\"}", "\"staf\"}")).contains("no segment 'staf'")
+
+test decode_more_errors = decode_err(doc().replace("\"plan\", \"op\": \"in\"", "\"plan\"")) == "flags[0].rules[0].when.any[1].op: is missing" and decode_err(doc().replace("\{\"segment\": \"staff\"}", "\{\"segment\": \"staff\", \"op\": \"in\"}")).contains("op and values belong to an attr clause") and decode_err(doc().replace("\"serve\": \{\"variant\": \"on\"}", "\"serve\": \{\"variant\": \"on\", \"bucket_by\": \"org\"}")) == "flags[0].rules[0].serve.bucket_by: belongs to a split"
+
+test single_definitions = do
+  f = decode_flag(encode_flag(colors()))
+  g = decode_segment(encode_segment(beta()))
+  f == ok(colors()) and g == ok(beta()) and decode_flag("\{}").is_err and decode_segment("[]").is_err and decode_flag(encode_flag(colors()).replace("\"In\"", "x")) == ok(colors())
+
+test files = do
+  path = env_var("TMPDIR").or("/tmp") + "/featureflags-test-{now_ms()}.json"
+  w = write_file(path, doc())
+  loaded = load_file(path)
+  gone = remove_file(path)
+  loaded.map(s => s.flags.keys) == ok(["checkout", "theme"]) and load_file(path).is_err
+
+test fingerprints = do
+  s = flags()
+  fingerprint(s) == fingerprint(snapshot(s.flags.values.reverse, s.segments.values)) and fingerprint(s) != fingerprint(s with flags := s.flags.remove("plain"))
+
+test builders = do
+  f = bool_flag("b", true).add_rule(rule("r", "x", Equals, ["1"], Fixed{variant: "off"})).add_target("off", ["k"]).add_prereq("p", ["on"]).with_fallthrough(Fixed{variant: "off"})
+  s = string_flag("s", false, [("a", "A")], "a", "a")
+  f.rules.len == 1 and f.targets == [Target{variant: "off", keys: ["k"]}] and f.prerequisites == [Prereq{flag: "p", variants: ["on"]}] and f.fallthrough == Fixed{variant: "off"} and s.variants == [("a", StrV{v: "A"})] and not s.enabled and snapshot([f, f with enabled := false], []).flags.get("b").map(x => x.enabled) == some(false)
+
+// ---------- store tests ----------
+
+fn st(f: () -> Bool ! db, fail[DbErr], fail[StoreErr]) -> Bool ! db
+= catch st_inner(f)
+  | Sql | Constraint | Busy | NoRow | Mismatch => false
+
+fn st_inner(f: () -> Bool ! db, fail[DbErr], fail[StoreErr]) -> Bool ! db, fail[DbErr]
+= catch f()
+  | Invalid | Conflict | NotFound => false
+
+fn store_err(f: () -> Unit ! db, fail[DbErr], fail[StoreErr]) -> Opt[StoreErr] ! db, fail[DbErr]
+= catch do
+  f()
+  none
+| Invalid{msg} => some(Invalid{msg})
+| Conflict{key, expected, actual} => some(Conflict{key, expected, actual})
+| NotFound{key} => some(NotFound{key})
+
+fn t0() -> Time
+= time_ms(1767225600000)
+
+fn fresh() -> Db ! db, fail[DbErr]
+= do
+  c = db.open(":memory:")
+  open_store(c)
+  open_store(c)
+  c
+
+test store_put_and_load = st(() => do
+  c = fresh()
+  v0 = store_version(c)
+  g = put_segment(c, beta(), some(0), "ada", t0())
+  f = put_flag(c, colors(), some(0), "ada", t0())
+  f2 = put_flag(c, colors() with enabled := false, some(1), "bob", t0().add(secs(5)))
+  s = load_store(c)
+  v0 == 0 and g == 1 and f.version == 1 and f2.version == 2 and store_version(c) == 3 and s.version == 3 and s.flags.get("color") == some(colors() with enabled := false, version := 2) and s.segments.get("beta") == some(beta()) and evaluate(s, "color", context("u")).reason == Disabled)
+
+test store_conflicts = st(() => do
+  c = fresh()
+  f = put_flag(c, bool_flag("a", true), none, "ada", t0())
+  stale = store_err(() => do
+    x = put_flag(c, bool_flag("a", false), some(0), "bob", t0())
+    ())
+  fresh_ok = put_flag(c, bool_flag("a", false), some(1), "bob", t0())
+  stale == some(Conflict{key: "a", expected: 0, actual: 1}) and fresh_ok.version == 2)
+
+test store_validates = st(() => do
+  c = fresh()
+  bad = store_err(() => do
+    x = put_flag(c, colors(), none, "ada", t0())
+    ())
+  seg = put_segment(c, beta(), none, "ada", t0())
+  f = put_flag(c, colors(), none, "ada", t0())
+  dep = put_flag(c, bool_flag("needs", true).add_prereq("color", ["blue"]), none, "ada", t0())
+  del_used = store_err(() => delete_flag(c, "color", none, "ada", t0()))
+  seg_used = store_err(() => delete_segment(c, "beta", none, "ada", t0()))
+  gone = store_err(() => delete_flag(c, "nope", none, "ada", t0()))
+  gone_seg = store_err(() => delete_segment(c, "nope", none, "ada", t0()))
+  bad.map(e => e is Invalid{msg} and msg.contains("no segment 'beta'")) == some(true) and del_used.map(e => e is Invalid{msg} and msg.contains("no flag 'color'")) == some(true) and seg_used.map(e => e is Invalid{msg: _}) == some(true) and gone == some(NotFound{key: "nope"}) and gone_seg == some(NotFound{key: "nope"}) and store_version(c) == 3)
+
+test store_deletes_and_history = st(() => do
+  c = fresh()
+  f = put_flag(c, bool_flag("a", true), none, "ada", t0())
+  g = put_flag(c, bool_flag("a", false), none, "bob", t0().add(secs(1)))
+  delete_flag(c, "a", some(2), "cy", t0().add(secs(2)))
+  s = put_segment(c, beta(), none, "ada", t0())
+  delete_segment(c, "beta", some(1), "ada", t0())
+  h = history(c, "flag", "a")
+  hs = history(c, "segment", "beta")
+  h.map(e => (e.action, e.actor, e.version)) == [("put", "ada", 1), ("put", "bob", 2), ("delete", "cy", 3)] and h[0].definition.map(d => decode_flag(d).is_ok) == some(true) and h[2].definition == none and h[1].at == t0().add(secs(1)) and hs.map(_.action) == ["put", "delete"] and load_store(c).flags.len == 0 and changes_since(c, 3).map(_.key) == ["beta", "beta"])
+
+test store_polling = st(() => do
+  c = fresh()
+  f = put_flag(c, bool_flag("a", true), none, "ada", t0())
+  s = load_store(c)
+  same = reload_if_changed(c, s.version)
+  g = put_flag(c, bool_flag("a", false), none, "ada", t0())
+  next = reload_if_changed(c, s.version)
+  same == none and next.map(n => (n.version, is_on(n, "a", context("u"), true))) == some((2, false)))
+
+test store_import = st(() => do
+  c = fresh()
+  old = put_flag(c, bool_flag("legacy", true), none, "ada", t0())
+  v = import_snapshot(c, flags() with flags := flags().flags.remove("broken").remove("cyc-a").remove("cyc-b").remove("needs-missing"), "deploy", t0())
+  again = import_snapshot(c, load_store(c), "deploy", t0())
+  s = load_store(c)
+  bad = store_err(() => do
+    x = import_snapshot(c, flags(), "deploy", t0())
+    ())
+  s.flags.has("color") and not s.flags.has("legacy") and s.segments.has("beta") and again == v and bad.map(e => e is Invalid{msg: _}) == some(true) and changes_since(c, 0).any(e => e.key == "legacy" and e.action == "delete"))
+
+test store_evaluates_directly = st(() => do
+  c = fresh()
+  g = put_segment(c, beta(), none, "ada", t0())
+  f = put_flag(c, colors(), none, "ada", t0())
+  n = put_flag(c, bool_flag("needs", true).add_prereq("color", ["blue"]), none, "ada", t0())
+  s = load_store(c)
+  ctxs = [context("vip"), ctx("u", [("country", "DE")]), context("tester"), context("plain")]
+  ctxs.all(x => evaluate_stored(c, "needs", x) == evaluate(s, "needs", x) and evaluate_stored(c, "color", x) == evaluate(s, "color", x)) and evaluate_stored(c, "nope", context("u")).error == some(FlagNotFound))
