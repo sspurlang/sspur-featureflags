@@ -1139,3 +1139,9 @@ test store_evaluates_directly = st(() => do
   s = load_store(c)
   ctxs = [context("vip"), ctx("u", [("country", "DE")]), context("tester"), context("plain")]
   ctxs.all(x => evaluate_stored(c, "needs", x) == evaluate(s, "needs", x) and evaluate_stored(c, "color", x) == evaluate(s, "color", x)) and evaluate_stored(c, "nope", context("u")).error == some(FlagNotFound))
+
+test store_opens_twice = st(() => do
+  c = db.open(":memory:")
+  open_store(c)
+  open_store(c)
+  store_version(c) == 0 and load_store(c) == snapshot([], []))
